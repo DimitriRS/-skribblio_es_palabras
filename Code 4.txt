@@ -1,0 +1,605 @@
+// ==UserScript==
+// @name         Herramienta para adivinar [PALABRAS] - Skribblio
+// @namespace    https://greasyfork.org/en/users/1084087-fermion
+// @version      1.2.0
+// @description  Skribbl.io palabras en español: panel movible/redimensionable, guarda palabras nuevas, filtra por longitud exacta, export/import, sugerencias centradas. + Búsqueda por grupos, descarte por ronda y botón "Nueva ronda".
+// @author       Dimitri
+// @match        http*://www.skribbl.io/*
+// @match        http*://skribbl.io/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @license      MIT
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  class WordSleuth {
+    constructor() {
+      this.gistWords = new Set();
+      this.correctAnswers = new Set(
+        GM_getValue('correctAnswers', [])
+          .map(w => String(w || '').trim().replace(/^['"]+|['"]+$/g, '').toLowerCase())
+          .filter(Boolean)
+      );
+
+      this.showOnlyNewState = false;
+      this.visibilityState = GM_getValue('parentElementVisible', true);
+
+      // NUEVO: estado de ronda y búsqueda
+      this.discardedThisRound = new Set();         // descartes temporales
+      this.searchQuery = '';                       // texto de la barra de búsqueda
+      this.taxonomyBuilt = false;                  // para no reconstruir en cada ciclo
+      this.groupIndex = new Map();                 // grupo -> Set(words)
+      this.wordToGroups = new Map();               // word -> Set(grupos)
+      this.availableGroups = new Set();            // nombres de grupos disponibles
+
+      this.createUI();
+      this.loadSavedPositionAndSize();
+      this.fetchAndStoreLatestWordlist();
+      this.observeHintsAndInput();
+      this.updateParentElementVisibility();
+
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'F2') this.toggleParentElementVisibility();
+      });
+    }
+
+    /* -------------------------------
+     * Utilidades
+     * ------------------------------- */
+    getInputElement() {
+      return document.querySelector('#game-chat input[data-translate="placeholder"]')
+        || document.querySelector('#game-chat input');
+    }
+
+    debounce(fn, delay = 120) {
+      let timeout;
+      return (...args) => {
+        clearTimeout(timeout);
+        timeout = setTimeout(() => fn.apply(this, args), delay);
+      };
+    }
+
+    saveCorrectAnswers() {
+      GM_setValue('correctAnswers', Array.from(this.correctAnswers));
+    }
+
+    getCombinedWords() {
+      return new Set([...this.gistWords, ...this.correctAnswers]);
+    }
+
+    /* -------------------------------
+     * UI
+     * ------------------------------- */
+    createUI() {
+      this.parentElement = document.createElement('div');
+      Object.assign(this.parentElement.style, {
+        position: 'fixed', top: '50px', right: '0',
+        width: '340px', height: 'calc(100% - 60px)',
+        backgroundColor: '#222', color: '#eee',
+        fontFamily: 'Arial, sans-serif', fontSize: '13px',
+        padding: '8px', overflow: 'hidden',
+        boxShadow: '-3px 0 10px rgba(0,0,0,0.7)',
+        zIndex: 99999, display: 'flex',
+        flexDirection: 'column', resize: 'both',
+        userSelect: 'none', cursor: 'default'
+      });
+      document.body.appendChild(this.parentElement);
+
+      this.dragBar = document.createElement('div');
+      this.dragBar.textContent = 'Skribbl Palabras (arrastrar aquí)';
+      Object.assign(this.dragBar.style, {
+        backgroundColor: '#111', padding: '6px', cursor: 'move',
+        fontWeight: '700', textAlign: 'center', userSelect: 'none',
+        borderRadius: '5px 5px 0 0', fontSize: '14px'
+      });
+      this.parentElement.appendChild(this.dragBar);
+
+      // NUEVO: barra de búsqueda
+      const searchWrap = document.createElement('div');
+      Object.assign(searchWrap.style, {
+        margin: '8px 0', display: 'flex', gap: '6px', alignItems: 'center'
+      });
+
+      this.searchInput = document.createElement('input');
+      Object.assign(this.searchInput, { type: 'text', placeholder: 'Buscar (ej: "pi", "grupo:frutas")' });
+      Object.assign(this.searchInput.style, {
+        flex: '1', padding: '6px 8px', borderRadius: '5px',
+        border: '1px solid #444', backgroundColor: '#1a1a1a', color: '#eee'
+      });
+      this.searchInput.title = 'Tip: combina texto y filtros por grupo: grupo:frutas grupo:animales';
+      this.searchInput.addEventListener('input', this.debounce(() => {
+        this.searchQuery = (this.searchInput.value || '').toLowerCase().trim();
+        this.generateGuesses();
+      }, 120));
+
+      // NUEVO: botón "Nueva ronda"
+      this.newRoundBtn = document.createElement('button');
+      this.newRoundBtn.textContent = 'Nueva ronda';
+      this.styleButton(this.newRoundBtn);
+      this.newRoundBtn.addEventListener('click', () => {
+        this.discardedThisRound.clear();
+        this.generateGuesses();
+      });
+
+      searchWrap.appendChild(this.searchInput);
+      searchWrap.appendChild(this.newRoundBtn);
+      this.parentElement.appendChild(searchWrap);
+
+      this.guessElem = document.createElement('div');
+      Object.assign(this.guessElem.style, {
+        flexGrow: '1', display: 'grid',
+        gridTemplateColumns: 'repeat(2, 1fr)',
+        gap: '6px', overflowY: 'auto',
+        backgroundColor: '#111', padding: '6px',
+        borderRadius: '0 0 6px 6px'
+      });
+      this.parentElement.appendChild(this.guessElem);
+
+      this.buttonsContainer = document.createElement('div');
+      Object.assign(this.buttonsContainer.style, {
+        marginTop: '10px', display: 'flex',
+        justifyContent: 'space-between', gap: '6px', userSelect: 'none', flexWrap: 'wrap'
+      });
+      this.parentElement.appendChild(this.buttonsContainer);
+
+      const buttons = [
+        { text: 'Exportar', action: () => this.exportNewWords() },
+        { text: 'Importar', action: () => this.importWords() },
+        { text: 'Agregar palabra', action: () => this.showAddWordPrompt() },
+        { text: 'Ver nuevas', action: () => this.showNewWords() },
+        { text: 'Ver solo nuevas', action: () => this.toggleShowOnlyNew() }
+      ];
+
+      buttons.forEach(btnData => {
+        const btn = document.createElement('button');
+        btn.textContent = btnData.text;
+        this.styleButton(btn);
+        btn.addEventListener('click', btnData.action);
+        this.buttonsContainer.appendChild(btn);
+      });
+
+      this.dragBar.addEventListener('mousedown', e => this.dragStart(e));
+      window.addEventListener('mouseup', () => this.dragEnd());
+      window.addEventListener('mousemove', e => this.dragMove(e));
+
+      this.resizeObserver = new ResizeObserver(() => this.adjustGridColumns());
+      this.resizeObserver.observe(this.parentElement);
+    }
+
+    styleButton(btn) {
+      Object.assign(btn.style, {
+        flexGrow: '1', padding: '6px 8px',
+        backgroundColor: '#007acc', border: 'none',
+        borderRadius: '5px', color: '#fff', fontWeight: '600',
+        cursor: 'pointer', userSelect: 'none', transition: 'background-color 0.18s',
+        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
+      });
+      btn.addEventListener('mouseenter', () => btn.style.backgroundColor = '#005fa3');
+      btn.addEventListener('mouseleave', () => btn.style.backgroundColor = '#007acc');
+    }
+
+    updateParentElementVisibility() {
+      this.parentElement.style.display = this.visibilityState ? 'flex' : 'none';
+      GM_setValue('parentElementVisible', this.visibilityState);
+    }
+
+    toggleParentElementVisibility() {
+      this.visibilityState = !this.visibilityState;
+      this.updateParentElementVisibility();
+    }
+
+    /* -------------------------------
+     * Palabras y filtros
+     * ------------------------------- */
+    fetchAndStoreLatestWordlist() {
+      const gistUrl = 'https://gist.githubusercontent.com/DimitriRS/a8d6633393f1fafc5e0ba609fdf7b86d/raw/f9fbc9025c04e79bbcf0eafaf1b41186a4debeb4/gistfile1.txt';
+      this.fetchWords(gistUrl).then(words => {
+        this.gistWords = new Set(words);
+        this.correctAnswers = new Set(
+          [...this.correctAnswers].filter(w => !this.gistWords.has(w))
+        );
+        this.saveCorrectAnswers();
+
+        // Si no hay palabras, avisamos y no seguimos
+        if (this.getCombinedWords().size === 0) {
+          alert('No se detectaron palabras disponibles (ni del gist ni guardadas). Revisa la conexión o la fuente antes de continuar.');
+          return;
+        }
+
+        // Construir taxonomía la primera vez
+        if (!this.taxonomyBuilt) {
+          this.buildTaxonomy();
+          this.taxonomyBuilt = true;
+        }
+
+        this.generateGuesses();
+      });
+    }
+
+    async fetchWords(url) {
+      try {
+        const resp = await fetch(url);
+        if (!resp.ok) return [];
+        return resp.text().then(txt =>
+          txt.split('\n').map(w => w.trim().toLowerCase()).filter(Boolean)
+        );
+      } catch (err) {
+        console.error(err);
+        return [];
+      }
+    }
+
+    // NUEVO: construcción de taxonomía (grupos)
+    buildTaxonomy() {
+      const words = [...this.getCombinedWords()];
+      const add = (group, word) => {
+        if (!group || !word) return;
+        if (!this.groupIndex.has(group)) this.groupIndex.set(group, new Set());
+        this.groupIndex.get(group).add(word);
+
+        if (!this.wordToGroups.has(word)) this.wordToGroups.set(word, new Set());
+        this.wordToGroups.get(word).add(group);
+
+        this.availableGroups.add(group);
+      };
+
+      // Listas base (editables/extendibles rápidamente)
+      const grupos = {
+        frutas: new Set(['banana','plátano','platano','manzana','pera','uva','piña','sandía','sandia','melón','melon','naranja','limón','limon','mandarina','fresa','frutilla','papaya','mango','guayaba','maracuyá','maracuya','mora','arándano','arandano','coco','durazno','melocotón','melocoton','ciruela','granada','kiwi','lulo','pitahaya','tamarindo','guanábana','guanabana','lúcuma','lucuma']),
+        colores: new Set(['rojo','azul','verde','amarillo','negro','blanco','morado','violeta','naranja','rosado','rosa','celeste','café','marrón','marron','gris','turquesa','magenta','cian','beige','dorado','plateado']),
+        animales: new Set(['perro','gato','caballo','vaca','toro','oveja','cabra','cerdo','pollo','pato','ganso','gallina','ratón','raton','conejo','tigre','león','leon','jirafa','elefante','mono','zorro','lobo','oso','delfín','delfin','ballena','pez','tiburón','tiburon','águila','aguila','halcón','halcon','búho','buho','serpiente','rana','sapo','lagarto','cocodrilo','camello','burro','yegua','gallito','gallito de las rocas']),
+        paises: new Set(['ecuador','perú','peru','colombia','venezuela','bolivia','chile','argentina','uruguay','paraguay','brasil','méxico','mexico','guatemala','honduras','el salvador','nicaragua','costa rica','panamá','panama','cuba','república dominicana','republica dominicana','puerto rico','españa','portugal','francia','alemania','italia','reino unido','inglaterra','rusia','china','japón','japon','india','canadá','canada','estados unidos','eeuu']),
+        meses: new Set(['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','setiembre','octubre','noviembre','diciembre']),
+        dias: new Set(['lunes','martes','miércoles','miercoles','jueves','viernes','sábado','sabado','domingo']),
+        formas: new Set(['círculo','circulo','cuadrado','triángulo','triangulo','rectángulo','rectangulo','pentágono','pentagono','hexágono','hexagono','óvalo','ovalo','rombo','trapecio','estrella']),
+        profesiones: new Set(['doctor','médico','medico','ingeniero','profesor','maestro','abogado','enfermera','enfermero','policía','policia','bombero','arquitecto','panadero','carpintero','pintor','mecánico','mecanico','electricista','plomero','soldador','conductor','piloto','periodista','fotógrafo','fotografo','chef','cocinero']),
+        deportes: new Set(['fútbol','futbol','baloncesto','básquet','basquet','béisbol','beisbol','tenis','voleibol','natación','natacion','atletismo','ciclismo','boxeo','gimnasia','karate','judo','taekwondo','surf','esgrima']),
+        ropa: new Set(['camisa','pantalón','pantalon','falda','vestido','zapato','zapatilla','tenis','gorra','sombrero','chaqueta','abrigo','bufanda','guante','calcetín','calcetin','medias','cinturón','cinturon']),
+        cuerpo: new Set(['cabeza','ojo','nariz','boca','oreja','mano','brazo','pierna','pie','dedo','codo','rodilla','espalda','cadera','hombro','corazón','corazon','pulmón','pulmon','hígado','higado','estómago','estomago']),
+        comida: new Set(['arroz','pan','sopa','ensalada','carne','pollo','pescado','huevo','queso','leche','yogur','yogurt','pizza','hamburguesa','taco','empanada','arepa','cuy','ceviche','bolón','bolon']),
+        vehículos: new Set(['auto','carro','coche','camión','camion','bus','autobús','autobus','moto','bicicleta','barco','avión','avion','helicóptero','helicoptero','tren','tractor','patineta','cohete']),
+        herramientas: new Set(['martillo','destornillador','taladro','llave','alicate','sierra','cincel','escuadra','metro','regla','serrucho','tenaza']),
+        tecnologia: new Set(['computadora','ordenador','teclado','ratón','raton','monitor','pantalla','impresora','móvil','movil','teléfono','telefono','tablet','cable','router','modem','usb'])
+      };
+
+      // Palabras del dataset que coinciden con los grupos fijos
+      for (const w of words) {
+        const lw = w.toLowerCase();
+        for (const [g, set] of Object.entries(grupos)) {
+          if (set.has(lw)) add(g, lw);
+        }
+        // Heurísticas adicionales
+        if (/(ar|er|ir)$/.test(lw)) add('verbos', lw);
+        if (/^[0-9]+$/.test(lw)) add('números', lw);
+        if (/[áéíóúñ]/.test(lw)) add('tiene-acentos', lw);
+        if (/\s/.test(lw)) add('compuestas', lw);
+        if (lw.length <= 4) add('cortas(≤4)', lw);
+        if (lw.length >= 10) add('largas(≥10)', lw);
+      }
+    }
+
+    parseSearchQuery() {
+      const q = (this.searchQuery || '').trim();
+      if (!q) return { textTokens: [], groupFilters: [] };
+
+      const parts = q.split(/\s+/);
+      const textTokens = [];
+      const groupFilters = [];
+
+      for (const p of parts) {
+        const m = p.match(/^grupo:(.+)$/);
+        if (m) {
+          groupFilters.push(m[1].toLowerCase());
+        } else {
+          textTokens.push(p.toLowerCase());
+        }
+      }
+      return { textTokens, groupFilters };
+    }
+
+    candidateFromGroups(groupFilters) {
+      if (!groupFilters.length) return null;
+      const norm = (s) => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+      const allGroups = [...this.availableGroups];
+
+      // Mapeo tolerante a tildes y variaciones
+      const matchedSets = [];
+      for (const gf of groupFilters) {
+        const gFound = allGroups.find(g => norm(g).includes(norm(gf)));
+        if (gFound && this.groupIndex.has(gFound)) {
+          matchedSets.push(this.groupIndex.get(gFound));
+        }
+      }
+      if (!matchedSets.length) return new Set(); // filtro no coincide con ningún grupo
+
+      // Unión de todos los conjuntos (una palabra puede pertenecer a múltiples)
+      const union = new Set();
+      matchedSets.forEach(s => s.forEach(w => union.add(w)));
+      return union;
+    }
+
+    generateGuesses() {
+      const hintElems = Array.from(document.querySelectorAll('.hints .hint'));
+      const inputElem = this.getInputElement();
+      if (!inputElem || !hintElems.length) return;
+
+      const hintPattern = hintElems.map(e => e.textContent === '_' ? '.' : e.textContent).join('');
+      const wordLength = hintElems.length;
+
+      let regex;
+      try { regex = new RegExp(`^${hintPattern}$`, 'i'); } catch { return; }
+
+      const userInput = String(inputElem.value || '').trim().toLowerCase();
+      let baseList = [...this.getCombinedWords()];
+      if (this.showOnlyNewState) baseList = [...this.correctAnswers];
+
+      // Filtrar descartes de la ronda
+      baseList = baseList.filter(w => !this.discardedThisRound.has(w));
+
+      // Aplicar búsqueda por grupos y texto
+      const { textTokens, groupFilters } = this.parseSearchQuery();
+      let byGroups = null;
+      if (groupFilters.length) {
+        byGroups = this.candidateFromGroups(groupFilters);
+        if (byGroups !== null) {
+          const byG = new Set(byGroups);
+          baseList = baseList.filter(w => byG.has(w));
+        }
+      }
+      if (textTokens.length) {
+        baseList = baseList.filter(w => textTokens.every(t => w.includes(t)));
+      }
+
+      const candidates = baseList.filter(word => {
+        if (word.length !== wordLength) return false;
+        if (userInput && !word.startsWith(userInput)) return false;
+        return regex.test(word);
+      });
+
+      this.renderGuesses(candidates.slice(0, 220), inputElem);
+    }
+
+    renderGuesses(words, inputElem) {
+      this.guessElem.innerHTML = '';
+      if (!words.length) {
+        const hint = document.createElement('div');
+        hint.textContent = '— sin coincidencias —';
+        Object.assign(hint.style, { color: '#ddd', textAlign: 'center', padding: '6px', fontSize: '12px' });
+        this.guessElem.appendChild(hint);
+        return;
+      }
+
+      words.forEach((word, i) => {
+        const div = document.createElement('div');
+        div.textContent = word;
+
+        const hue = Math.floor(120 * (i / (words.length - 1 || 1)));
+        Object.assign(div.style, {
+          backgroundColor: `hsl(${hue},80%,45%)`,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          cursor: 'pointer', padding: '6px 8px', minHeight: '40px',
+          borderRadius: '6px', userSelect: 'none', fontWeight: '600',
+          color: 'white', textAlign: 'center', boxShadow: '0 1px 3px rgba(0,0,0,0.3)',
+          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'
+        });
+
+        div.title = 'Clic: enviar y descartar • Ctrl+clic: enviar sin descartar • Alt+clic: descartar sin enviar';
+
+        div.addEventListener('mouseenter', () => div.style.filter = 'brightness(1.2)');
+        div.addEventListener('mouseleave', () => div.style.filter = 'brightness(1)');
+
+        // Comportamientos:
+        // - Click normal: enviar y descartar (asume intento fallido si no acierta)
+        // - Ctrl+click: enviar sin descartar
+        // - Alt+click: descartar sin enviar
+        div.addEventListener('click', (ev) => {
+          const ctrl = ev.ctrlKey || ev.metaKey;
+          const alt = ev.altKey;
+
+          try {
+            if (!alt) {
+              // Enviar
+              inputElem.value = word;
+              const form = inputElem.closest('form') || document.querySelector('#game-chat form');
+              if (form) form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+            }
+            if (!ctrl) {
+              // Descartar en esta ronda
+              this.discardedThisRound.add(word);
+              div.style.display = 'none';
+            }
+          } catch (e) { console.error(e); }
+        });
+
+        this.guessElem.appendChild(div);
+      });
+    }
+
+    /* -------------------------------
+     * Gestión de palabras nuevas
+     * ------------------------------- */
+    showAddWordPrompt() {
+      let newWord = prompt('Ingrese palabra para agregar (se permiten espacios y acentos):');
+      if (!newWord) return;
+      newWord = newWord.trim().toLowerCase().replace(/^['"]+|['"]+$/g, '');
+      if (!newWord) return alert('Palabra vacía no válida.');
+      if (/[^a-záéíóúñü\s.-]/i.test(newWord)) return alert('Caracteres inválidos.');
+      if (this.gistWords.has(newWord) || this.correctAnswers.has(newWord)) return alert('Ya existe.');
+      this.correctAnswers.add(newWord);
+      this.saveCorrectAnswers();
+
+      // Añadir a grupos si corresponde
+      if (this.taxonomyBuilt) {
+        // reglas básicas rápidas
+        const quick = [
+          ['verbos', /(ar|er|ir)$/],
+          ['tiene-acentos', /[áéíóúñ]/],
+          ['compuestas', /\s/],
+          ['cortas(≤4)', /^.{1,4}$/],
+          ['largas(≥10)', /^.{10,}$/]
+        ];
+        for (const [g, r] of quick) if (r.test(newWord)) this._addToGroup(g, newWord);
+      }
+
+      alert(`Palabra "${newWord}" agregada.`);
+      this.generateGuesses();
+    }
+
+    _addToGroup(group, word) {
+      if (!this.groupIndex.has(group)) this.groupIndex.set(group, new Set());
+      this.groupIndex.get(group).add(word);
+      if (!this.wordToGroups.has(word)) this.wordToGroups.set(word, new Set());
+      this.wordToGroups.get(word).add(group);
+      this.availableGroups.add(group);
+    }
+
+    showNewWords() {
+      const newWords = [...this.correctAnswers].filter(w => !this.gistWords.has(w));
+      if (!newWords.length) return alert('No hay palabras nuevas guardadas.');
+      alert('Palabras nuevas:\n' + newWords.join(', '));
+    }
+
+    exportNewWords() {
+      const newWords = [...this.correctAnswers].filter(w => !this.gistWords.has(w));
+      if (!newWords.length) return alert('No hay palabras nuevas para exportar.');
+      const blob = new Blob([newWords.join('\n')], { type: 'text/plain;charset=utf-8' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'nuevas_palabras.txt';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
+
+    importWords() {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = '.txt';
+      input.addEventListener('change', e => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = evt => {
+          const words = evt.target.result
+            .split('\n')
+            .map(w => w.trim().toLowerCase())
+            .filter(Boolean);
+          let count = 0;
+          words.forEach(w => {
+            if (!this.correctAnswers.has(w) && !this.gistWords.has(w)) {
+              this.correctAnswers.add(w);
+              count++;
+            }
+          });
+          this.saveCorrectAnswers();
+          alert(`Se importaron ${count} palabras nuevas.`);
+          // reconstruir taxonomía para incluir importadas
+          this.taxonomyBuilt = false;
+          this.buildTaxonomy();
+          this.taxonomyBuilt = true;
+          this.generateGuesses();
+        };
+        reader.readAsText(file);
+      });
+      input.click();
+    }
+
+    toggleShowOnlyNew() {
+      this.showOnlyNewState = !this.showOnlyNewState;
+      this.generateGuesses();
+    }
+
+    /* -------------------------------
+     * Drag & Resize
+     * ------------------------------- */
+    dragStart(e) {
+      if (e.target !== this.dragBar) return;
+      this.dragging = true;
+      this.dragStartX = e.clientX; this.dragStartY = e.clientY;
+      const rect = this.parentElement.getBoundingClientRect();
+      this.elemStartLeft = rect.left; this.elemStartTop = rect.top;
+      e.preventDefault();
+    }
+
+    dragMove(e) {
+      if (!this.dragging) return;
+      let l = this.elemStartLeft + (e.clientX - this.dragStartX),
+        t = this.elemStartTop + (e.clientY - this.dragStartY);
+      l = Math.min(window.innerWidth - this.parentElement.offsetWidth, Math.max(0, l));
+      t = Math.min(window.innerHeight - this.parentElement.offsetHeight, Math.max(0, t));
+      this.parentElement.style.left = l + 'px';
+      this.parentElement.style.top = t + 'px';
+      this.parentElement.style.right = 'auto'; this.parentElement.style.bottom = 'auto';
+    }
+
+    dragEnd() {
+      if (!this.dragging) return;
+      this.dragging = false;
+      GM_setValue('panelPos', {
+        left: parseInt(this.parentElement.style.left || 0, 10),
+        top: parseInt(this.parentElement.style.top || 0, 10)
+      });
+    }
+
+    loadSavedPositionAndSize() {
+      const pos = GM_getValue('panelPos', null);
+      const size = GM_getValue('panelSize', null);
+      if (pos) {
+        this.parentElement.style.left = pos.left + 'px';
+        this.parentElement.style.top = pos.top + 'px';
+        this.parentElement.style.right = 'auto';
+      } else {
+        this.parentElement.style.right = '0px';
+        this.parentElement.style.top = '50px';
+      }
+      if (size) {
+        this.parentElement.style.width = size.width + 'px';
+        this.parentElement.style.height = size.height + 'px';
+      }
+    }
+
+    adjustGridColumns() {
+      const width = this.parentElement.clientWidth;
+      const cols = Math.max(1, Math.floor(width / 160));
+      this.guessElem.style.gridTemplateColumns = `repeat(${cols},1fr)`;
+      const rect = this.parentElement.getBoundingClientRect();
+      GM_setValue('panelSize', { width: Math.round(rect.width), height: Math.round(rect.height) });
+    }
+
+    /* -------------------------------
+     * Observadores
+     * ------------------------------- */
+    observeHintsAndInput() {
+      const update = this.debounce(() => this.generateGuesses(), 120);
+
+      const hintContainer = document.querySelector('.hints .container') || document.querySelector('.hints');
+      if (hintContainer) {
+        new MutationObserver(update).observe(hintContainer, { childList: true, subtree: true });
+      }
+
+      const gameWord = document.querySelector('#game-word');
+      if (gameWord) {
+        new MutationObserver(update).observe(gameWord, { childList: true, subtree: true });
+      }
+
+      const input = this.getInputElement();
+      if (input) input.addEventListener('input', update);
+
+      this.ensureObserversExist(update);
+    }
+
+    ensureObserversExist(update) {
+      const trySetup = () => {
+        const hintExists = !!(document.querySelector('.hints .container') || document.querySelector('.hints'));
+        const inputExists = !!this.getInputElement();
+        if (!hintExists || !inputExists) setTimeout(trySetup, 700);
+        else update();
+      };
+      trySetup();
+    }
+  }
+
+  new WordSleuth();
+})();
