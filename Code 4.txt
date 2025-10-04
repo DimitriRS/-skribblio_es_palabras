@@ -1,9 +1,11 @@
 // ==UserScript==
-// @name         Herramienta para adivinar [PALABRAS] - Skribblio
+// @name         Codigo (WordSleuth+) — búsqueda y grupos
 // @namespace    https://greasyfork.org/en/users/1084087-fermion
-// @version      1.2.0
+// @version      1.2.3
+// @downloadURL  https://raw.githubusercontent.com/DimitriRS/-skribblio_es_palabras/main/Code%204.txt
+// @updateURL    https://raw.githubusercontent.com/DimitriRS/-skribblio_es_palabras/main/Code%204.txt
 // @description  Skribbl.io palabras en español: panel movible/redimensionable, guarda palabras nuevas, filtra por longitud exacta, export/import, sugerencias centradas. + Búsqueda por grupos, descarte por ronda y botón "Nueva ronda".
-// @author       Dimitri
+// @author       fermion + mod Dimitri (refactor ChatGPT) + SeniorPatch
 // @match        http*://www.skribbl.io/*
 // @match        http*://skribbl.io/*
 // @grant        GM_setValue
@@ -26,13 +28,13 @@
       this.showOnlyNewState = false;
       this.visibilityState = GM_getValue('parentElementVisible', true);
 
-      // NUEVO: estado de ronda y búsqueda
-      this.discardedThisRound = new Set();         // descartes temporales
-      this.searchQuery = '';                       // texto de la barra de búsqueda
-      this.taxonomyBuilt = false;                  // para no reconstruir en cada ciclo
-      this.groupIndex = new Map();                 // grupo -> Set(words)
-      this.wordToGroups = new Map();               // word -> Set(grupos)
-      this.availableGroups = new Set();            // nombres de grupos disponibles
+      // Estado de ronda y búsqueda
+      this.discardedThisRound = new Set(); // descartes temporales
+      this.searchQuery = '';               // texto de la barra de búsqueda
+      this.taxonomyBuilt = false;          // para no reconstruir en cada ciclo
+      this.groupIndex = new Map();         // grupo -> Set(words)
+      this.wordToGroups = new Map();       // word -> Set(grupos)
+      this.availableGroups = new Set();    // nombres de grupos disponibles
 
       this.createUI();
       this.loadSavedPositionAndSize();
@@ -96,7 +98,7 @@
       });
       this.parentElement.appendChild(this.dragBar);
 
-      // NUEVO: barra de búsqueda
+      // Barra de búsqueda
       const searchWrap = document.createElement('div');
       Object.assign(searchWrap.style, {
         margin: '8px 0', display: 'flex', gap: '6px', alignItems: 'center'
@@ -114,7 +116,7 @@
         this.generateGuesses();
       }, 120));
 
-      // NUEVO: botón "Nueva ronda"
+      // Botón "Nueva ronda"
       this.newRoundBtn = document.createElement('button');
       this.newRoundBtn.textContent = 'Nueva ronda';
       this.styleButton(this.newRoundBtn);
@@ -194,33 +196,34 @@
      * Palabras y filtros
      * ------------------------------- */
     fetchAndStoreLatestWordlist() {
-      const gistUrl = 'https://gist.githubusercontent.com/DimitriRS/a8d6633393f1fafc5e0ba609fdf7b86d/raw/f9fbc9025c04e79bbcf0eafaf1b41186a4debeb4/gistfile1.txt';
-      this.fetchWords(gistUrl).then(words => {
+      // URL RAW del archivo de palabras en tu repo (respetando mayúsculas/minúsculas)
+      const WORDS_URL = 'https://raw.githubusercontent.com/DimitriRS/-skribblio_es_palabras/main/Palabras.txt';
+
+      this.fetchWords(WORDS_URL).then(words => {
         this.gistWords = new Set(words);
         this.correctAnswers = new Set(
           [...this.correctAnswers].filter(w => !this.gistWords.has(w))
         );
         this.saveCorrectAnswers();
 
-        // Si no hay palabras, avisamos y no seguimos
         if (this.getCombinedWords().size === 0) {
-          alert('No se detectaron palabras disponibles (ni del gist ni guardadas). Revisa la conexión o la fuente antes de continuar.');
+          alert('No se detectaron palabras disponibles (ni remotas ni guardadas). Revisa el origen.');
           return;
         }
 
-        // Construir taxonomía la primera vez
         if (!this.taxonomyBuilt) {
           this.buildTaxonomy();
           this.taxonomyBuilt = true;
         }
-
         this.generateGuesses();
       });
     }
 
     async fetchWords(url) {
       try {
-        const resp = await fetch(url);
+        // Cache buster + no-store para evitar respuestas antiguas del CDN
+        const bust = (url.includes('?') ? '&' : '?') + 'v=' + Date.now();
+        const resp = await fetch(url + bust, { cache: 'no-store' });
         if (!resp.ok) return [];
         return resp.text().then(txt =>
           txt.split('\n').map(w => w.trim().toLowerCase()).filter(Boolean)
@@ -231,7 +234,7 @@
       }
     }
 
-    // NUEVO: construcción de taxonomía (grupos)
+    // Construcción de taxonomía (grupos)
     buildTaxonomy() {
       const words = [...this.getCombinedWords()];
       const add = (group, word) => {
@@ -245,11 +248,11 @@
         this.availableGroups.add(group);
       };
 
-      // Listas base (editables/extendibles rápidamente)
+      // Listas base (editables/extendibles)
       const grupos = {
         frutas: new Set(['banana','plátano','platano','manzana','pera','uva','piña','sandía','sandia','melón','melon','naranja','limón','limon','mandarina','fresa','frutilla','papaya','mango','guayaba','maracuyá','maracuya','mora','arándano','arandano','coco','durazno','melocotón','melocoton','ciruela','granada','kiwi','lulo','pitahaya','tamarindo','guanábana','guanabana','lúcuma','lucuma']),
         colores: new Set(['rojo','azul','verde','amarillo','negro','blanco','morado','violeta','naranja','rosado','rosa','celeste','café','marrón','marron','gris','turquesa','magenta','cian','beige','dorado','plateado']),
-        animales: new Set(['perro','gato','caballo','vaca','toro','oveja','cabra','cerdo','pollo','pato','ganso','gallina','ratón','raton','conejo','tigre','león','leon','jirafa','elefante','mono','zorro','lobo','oso','delfín','delfin','ballena','pez','tiburón','tiburon','águila','aguila','halcón','halcon','búho','buho','serpiente','rana','sapo','lagarto','cocodrilo','camello','burro','yegua','gallito','gallito de las rocas']),
+        animales: new Set(['perro','gato','caballo','vaca','toro','oveja','cabra','cerdo','pollo','pato','ganso','gallina','ratón','raton','conejo','tigre','león','leon','jirafa','elefante','mono','zorro','lobo','oso','delfín','delfin','ballena','pez','tiburón','tiburon','águila','aguila','halcón','halcon','búho','buho','serpiente','rana','sapo','lagarto','cocodrilo','camello','burro','yegua']),
         paises: new Set(['ecuador','perú','peru','colombia','venezuela','bolivia','chile','argentina','uruguay','paraguay','brasil','méxico','mexico','guatemala','honduras','el salvador','nicaragua','costa rica','panamá','panama','cuba','república dominicana','republica dominicana','puerto rico','españa','portugal','francia','alemania','italia','reino unido','inglaterra','rusia','china','japón','japon','india','canadá','canada','estados unidos','eeuu']),
         meses: new Set(['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','setiembre','octubre','noviembre','diciembre']),
         dias: new Set(['lunes','martes','miércoles','miercoles','jueves','viernes','sábado','sabado','domingo']),
@@ -264,7 +267,6 @@
         tecnologia: new Set(['computadora','ordenador','teclado','ratón','raton','monitor','pantalla','impresora','móvil','movil','teléfono','telefono','tablet','cable','router','modem','usb'])
       };
 
-      // Palabras del dataset que coinciden con los grupos fijos
       for (const w of words) {
         const lw = w.toLowerCase();
         for (const [g, set] of Object.entries(grupos)) {
@@ -304,7 +306,6 @@
       const norm = (s) => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
       const allGroups = [...this.availableGroups];
 
-      // Mapeo tolerante a tildes y variaciones
       const matchedSets = [];
       for (const gf of groupFilters) {
         const gFound = allGroups.find(g => norm(g).includes(norm(gf)));
@@ -312,9 +313,8 @@
           matchedSets.push(this.groupIndex.get(gFound));
         }
       }
-      if (!matchedSets.length) return new Set(); // filtro no coincide con ningún grupo
+      if (!matchedSets.length) return new Set();
 
-      // Unión de todos los conjuntos (una palabra puede pertenecer a múltiples)
       const union = new Set();
       matchedSets.forEach(s => s.forEach(w => union.add(w)));
       return union;
@@ -381,7 +381,7 @@
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           cursor: 'pointer', padding: '6px 8px', minHeight: '40px',
           borderRadius: '6px', userSelect: 'none', fontWeight: '600',
-          color: 'white', textAlign: 'center', boxShadow: '0 1px 3px rgba(0,0,0,0.3)',
+          color: 'white', textAlign: 'center', boxShadow: '0 1px 3px rgba(0,0,0,0.3)`,
           overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'
         });
 
@@ -390,23 +390,20 @@
         div.addEventListener('mouseenter', () => div.style.filter = 'brightness(1.2)');
         div.addEventListener('mouseleave', () => div.style.filter = 'brightness(1)');
 
-        // Comportamientos:
-        // - Click normal: enviar y descartar (asume intento fallido si no acierta)
-        // - Ctrl+click: enviar sin descartar
-        // - Alt+click: descartar sin enviar
+        // Click normal: enviar y descartar
+        // Ctrl+click: enviar sin descartar
+        // Alt+click: descartar sin enviar
         div.addEventListener('click', (ev) => {
           const ctrl = ev.ctrlKey || ev.metaKey;
           const alt = ev.altKey;
 
           try {
             if (!alt) {
-              // Enviar
               inputElem.value = word;
               const form = inputElem.closest('form') || document.querySelector('#game-chat form');
               if (form) form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
             }
             if (!ctrl) {
-              // Descartar en esta ronda
               this.discardedThisRound.add(word);
               div.style.display = 'none';
             }
@@ -432,7 +429,6 @@
 
       // Añadir a grupos si corresponde
       if (this.taxonomyBuilt) {
-        // reglas básicas rápidas
         const quick = [
           ['verbos', /(ar|er|ir)$/],
           ['tiene-acentos', /[áéíóúñ]/],
@@ -526,7 +522,7 @@
     dragMove(e) {
       if (!this.dragging) return;
       let l = this.elemStartLeft + (e.clientX - this.dragStartX),
-        t = this.elemStartTop + (e.clientY - this.dragStartY);
+          t = this.elemStartTop + (e.clientY - this.dragStartY);
       l = Math.min(window.innerWidth - this.parentElement.offsetWidth, Math.max(0, l));
       t = Math.min(window.innerHeight - this.parentElement.offsetHeight, Math.max(0, t));
       this.parentElement.style.left = l + 'px';
@@ -603,3 +599,4 @@
 
   new WordSleuth();
 })();
+
