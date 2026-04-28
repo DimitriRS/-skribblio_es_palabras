@@ -4020,3 +4020,6 @@ cuerpo
 mueble
 engrapadora
 mr. bean
+hidra
+carcel
+pared
