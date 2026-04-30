@@ -4042,3 +4042,6 @@ pantunflas
 lluvia radiactiva
 soñar
 espia
+pez estrella
+silueta
+tijera
