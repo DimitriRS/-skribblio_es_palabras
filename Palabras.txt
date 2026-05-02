@@ -4060,3 +4060,7 @@ mascara
 brocoli
 arañar
 lagartija
+planeta tierra
+espina
+reventar
+musculoso
