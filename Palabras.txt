@@ -4081,3 +4081,5 @@ resorte
 hacha
 mantarraya
 la muerte
+gaseosa
+palta
